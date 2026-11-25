@@ -160,7 +160,7 @@ for fileLoop = filesToProcess
     for plotLoop = 1:nCols
         subplot(nCols, 1, plotLoop)
         plot(extractedMat(:, plotLoop))
-        xlabel(colTitles{plotLoop})
+        ylabel(colTitles{plotLoop})
     end
 
 end
