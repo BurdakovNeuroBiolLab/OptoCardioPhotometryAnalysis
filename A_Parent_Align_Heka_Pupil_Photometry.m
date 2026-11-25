@@ -1,7 +1,7 @@
 %% A_Parent_Align_Heka_Pupil_Photometry
 % Parent script: loads the pupil video data and the HEKA recording from the
-% MATLAB current folder and puts the pupil diameter on the same time base
-% as the photometry traces.
+% MATLAB current folder, puts the pupil diameter on the same time base as
+% the photometry traces, and extracts heart rate and running.
 %
 % Same approach as A_Parent_Align_Heka_Pupil_Inscopix in
 % OptoCardioInscopixAnalysis.
@@ -12,8 +12,11 @@
 %   3. alignPupilToPhotometry.m  -> pupil added as column 11, using the
 %                                   Cam Synch high period (first rise to
 %                                   last fall = start and end of the CSV)
-%   4. Figure of photometry, laser and pupil over the camera period
-%   5. Save
+%   4. Heart rate from the ECG R peaks (same method as the GRIN code)
+%   5. Running speed from the rotary encoder
+%   6. Figure of photometry, laser, heart rate, pupil and running over the
+%      camera period
+%   7. Save
 %
 % The current folder must contain exactly one of each:
 %   *zoompup*.csv (DeepLabCut pupil) and the HEKA export *L.mat.
@@ -22,14 +25,19 @@
 % Output (in the workspace, and saved to <HEKA name>_pupilAligned.mat)
 %   extractedMat      (nSamples x 11), 2.5 ms per row
 %   extractedMatCrop  extractedMat cropped to the camera period
-%   Columns: 1 HR          5 Phot 1 405   9  Phot 2 465
-%            2 Rotary 1    6 Phot 1 465   10 Cam synch
-%            3 Laser       7 Phot 2 raw   11 Pupil diameter (px)
-%            4 Phot 1 raw  8 Phot 2 405
+%   Columns: 1 HR (raw ECG)  5 Phot 1 405   9  Phot 2 465
+%            2 Rotary 1      6 Phot 1 465   10 Cam synch
+%            3 Laser         7 Phot 2 raw   11 Pupil diameter (px)
+%            4 Phot 1 raw    8 Phot 2 405
 %   colTitles         column names
 %   hekaMs            time of every row of extractedMat (ms)
 %   hekaMsCrop        time of every row of extractedMatCrop (ms)
 %   pupilHekaT        centre of each video frame in HEKA time (ms)
+%   hrCrop            heart rate (bpm) at every row of extractedMatCrop
+%   rT                R-peak times (HEKA s), refined to sub-sample precision
+%   beatT, beatHR     time (HEKA s) and rate (bpm) of every beat-to-beat interval
+%   okHR              true for beat intervals kept (not missed / extra beats)
+%   runCrop           running (encoder ticks/s) at every row of extractedMatCrop
 
 clear; clc;
 
@@ -40,12 +48,24 @@ expectedFps = [];     % camera frame rate (Hz). If set, warn when the rate
 fpsTol      = 0.02;   % fractional tolerance for the frame-rate check
 saveAligned = true;   % save the aligned data to a .mat in the current folder
 
+% Heart rate from the ECG (defaults for mouse, as in the GRIN code)
+hrRange       = [250 900]; % bpm; beats outside this range are dropped
+hrThreshFrac  = 0.5;       % R-peak threshold as a fraction of the ECG 99.5th percentile
+hrBaselineWin = 0.05;      % s, moving-mean window removed from the ECG
+ibiRelTol     = 0.3;       % drop IBIs > 30% away from the running median (missed /
+                           % extra beats)
+showHRCheck   = false;     % true = extra figure with the detected R peaks
+
+% Running from the rotary encoder
+runWinSec = 0.5;           % s, window over which encoder ticks are counted
+
 %% ---------------- Put the child scripts on the path ----------------
 alignRepoDir = fileparts(mfilename('fullpath'));
 if ~isempty(alignRepoDir)
     addpath(alignRepoDir);
 end
-childScripts = {'pupilCircleFit', 'A_Extract_HekaData', 'alignPupilToPhotometry'};
+childScripts = {'pupilCircleFit', 'A_Extract_HekaData', 'alignPupilToPhotometry', ...
+                'flag_bad_ibi'};
 for scriptLoop = 1:numel(childScripts)
     if isempty(which(childScripts{scriptLoop}))
         error(['Cannot find %s.m. Keep all the repository''s .m files in one ' ...
@@ -87,6 +107,9 @@ fprintf('HEKA file: %s\n', hekaFile);
 %% ---------------- 3. Pupil onto the HEKA time base ----------------
 alignPupilToPhotometry;        % adds column 11, extractedMatCrop, camRise/Fall
 hekaMsCrop = hekaMs(camRise:camFall);
+hekaT      = hekaMsCrop / 1000;                    % crop samples, HEKA s
+hekaFs     = 1000 / sampleIntervalMs;              % Hz
+nCrop      = numel(hekaT);
 
 if ~isempty(expectedFps)
     impliedFps = 1000 / pupilPeriodMs;
@@ -97,20 +120,86 @@ if ~isempty(expectedFps)
     end
 end
 
-%% ---------------- 4. Photometry, laser and pupil over the camera period
-plotCols   = [6 5 9 8 3 11];
-plotColour = {[0 0.6 0], [0.7 0 0.7], [0 0.6 0], [0.7 0 0.7], [0 0 0.8], [0.9 0.5 0]};
-cropTimeS  = (hekaMsCrop - hekaMsCrop(1)) / 1000;    % s from camera start
+%% ---------------- 4. Heart rate from the ECG ----------------
+% Same method as A_Parent_Align_Heka_Pupil_Inscopix: R peaks are found in
+% the full-rate ECG of the crop, refined to sub-sample precision and turned
+% into beat-to-beat heart rate, which is interpolated onto every sample.
+ecg      = extractedMatCrop(:, 1);
+ecgHP    = ecg - movmean(ecg, max(3, round(hrBaselineWin * hekaFs)), 'omitnan');
+if abs(localPrctile(ecgHP, 0.1)) > abs(localPrctile(ecgHP, 99.9))
+    ecgHP = -ecgHP;                                        % R peaks point down
+end
+hrThresh = hrThreshFrac * localPrctile(ecgHP, 99.5);
+candPeaks = find(ecgHP(2:end-1) > hrThresh & ecgHP(2:end-1) >= ecgHP(1:end-2) & ...
+                 ecgHP(2:end-1) > ecgHP(3:end)) + 1;
 
-nPlots = numel(plotCols);
-figure('Name', 'Photometry and pupil', 'Renderer', 'painters', ...
-       'Position', [900 100 700 800]);
+% Refractory period: of two peaks closer than 60/maxBpm, keep the larger
+minGap = round(60 / hrRange(2) * hekaFs);
+rIdx = zeros(numel(candPeaks), 1); nR = 0;
+for peakLoop = 1:numel(candPeaks)
+    if nR > 0 && candPeaks(peakLoop) - rIdx(nR) < minGap
+        if ecgHP(candPeaks(peakLoop)) > ecgHP(rIdx(nR))
+            rIdx(nR) = candPeaks(peakLoop);
+        end
+    else
+        nR = nR + 1; rIdx(nR) = candPeaks(peakLoop);
+    end
+end
+rIdx = rIdx(1:nR);
+
+% Parabolic interpolation through each peak and its two neighbours: the peak
+% time is only known to +/- half a sample (1.25 ms at 400 Hz), which would
+% otherwise add several bpm of jitter to beat-to-beat HR.
+pkShift   = zeros(nR, 1);
+innerPeak = rIdx > 1 & rIdx < numel(ecgHP);
+ecgBefore = ecgHP(rIdx(innerPeak) - 1);
+ecgPeak   = ecgHP(rIdx(innerPeak));
+ecgAfter  = ecgHP(rIdx(innerPeak) + 1);
+peakShift = 0.5 * (ecgBefore - ecgAfter) ./ (ecgBefore - 2 * ecgPeak + ecgAfter);
+peakShift(~isfinite(peakShift)) = 0;
+pkShift(innerPeak) = max(-0.5, min(0.5, peakShift));
+
+rT     = hekaT(rIdx) + pkShift / hekaFs;                   % HEKA s
+beatT  = (rT(1:end-1) + rT(2:end)) / 2;                    % HEKA s
+beatHR = 60 ./ diff(rT);                                   % bpm
+ibiRangeSec = sort(60 ./ hrRange);
+okHR   = ~flag_bad_ibi(diff(rT), ibiRangeSec, ibiRelTol, 21);
+
+if nnz(okHR) >= 2
+    hrCrop = interp1(beatT(okHR), beatHR(okHR), hekaT, 'linear', NaN);
+else
+    hrCrop = nan(nCrop, 1);
+    warning('Fewer than 2 heart beats detected; check hrThreshFrac / hrRange.');
+end
+fprintf('Heart rate: %d R peaks, median %.0f bpm (%d IBIs dropped: outside hrRange or >%g%% from local median)\n', ...
+        nR, median(beatHR(okHR)), nnz(~okHR), 100 * ibiRelTol);
+
+%% ---------------- 5. Running from the rotary encoder ----------------
+% Every state change of the binarised encoder is one tick; ticks are
+% counted in a sliding window of runWinSec and converted to ticks per second.
+runTicks = [0; abs(diff(extractedMatCrop(:, 2)))];
+runWinSamples = max(1, round(runWinSec * hekaFs));
+runCrop  = movsum(runTicks, runWinSamples) / (runWinSamples / hekaFs);
+
+%% ---------------- 6. Final figure over the camera period ----------------
+cropTimeS = hekaT - hekaT(1);                        % s from camera start
+
+plotTraces = {extractedMatCrop(:, 6), extractedMatCrop(:, 5), ...
+              extractedMatCrop(:, 9), extractedMatCrop(:, 8), ...
+              extractedMatCrop(:, 3), hrCrop, extractedMatCrop(:, 11), runCrop};
+plotNames  = {'Phot1 465', 'Phot1 405', 'Phot2 465', 'Phot2 405', ...
+              'Laser', 'HR (bpm)', 'Pupil (px)', 'Run (ticks/s)'};
+plotColour = {[0 0.6 0], [0.7 0 0.7], [0 0.6 0], [0.7 0 0.7], ...
+              [0 0 0.8], [0.85 0.1 0.1], [0.9 0.5 0], [0.2 0.6 0.9]};
+
+nPlots = numel(plotTraces);
+figure('Name', 'Photometry, heart rate, pupil and running', 'Renderer', 'painters', ...
+       'Position', [900 50 700 900]);
 axPlots = gobjects(nPlots, 1);
 for plotLoop = 1:nPlots
     axPlots(plotLoop) = subplot(nPlots, 1, plotLoop);
-    plot(cropTimeS, extractedMatCrop(:, plotCols(plotLoop)), ...
-         'Color', plotColour{plotLoop})
-    ylabel(colTitles{plotCols(plotLoop)})
+    plot(cropTimeS, plotTraces{plotLoop}, 'Color', plotColour{plotLoop})
+    ylabel(plotNames{plotLoop})
     box off
     if plotLoop < nPlots
         set(axPlots(plotLoop), 'XTickLabel', []);
@@ -120,12 +209,31 @@ xlabel(axPlots(end), 'Time from camera start (s)')
 linkaxes(axPlots, 'x');
 xlim(axPlots(end), [cropTimeS(1) cropTimeS(end)]);
 
-%% ---------------- 5. Save ----------------
+%% ---------------- Optional: ECG peak check ----------------
+if showHRCheck
+    figure('Name', 'ECG R-peak detection', 'Position', [100 100 1200 400]);
+    plot(cropTimeS, ecgHP, 'k'); hold on
+    plot(rT - hekaT(1), ecgHP(rIdx), 'r.', 'MarkerSize', 10);
+    yline(hrThresh, 'b--'); hold off
+    xlabel('Time from camera start (s)'); ylabel('ECG (baseline removed)');
+end
+
+%% ---------------- 7. Save ----------------
 if saveAligned
     [~, hekaBase] = fileparts(hekaFile);
     alignedFile = fullfile(pwd, [hekaBase '_pupilAligned.mat']);
     save(alignedFile, 'extractedMat', 'extractedMatCrop', 'colTitles', ...
          'hekaMs', 'hekaMsCrop', 'camRise', 'camFall', 'pupilDiameter', ...
-         'pupilHekaT', 'pupilPeriodMs', 'sampleIntervalMs', 'hekaFile', 'pupilFile');
+         'pupilHekaT', 'pupilPeriodMs', 'sampleIntervalMs', ...
+         'hrCrop', 'rT', 'beatT', 'beatHR', 'okHR', 'runCrop', 'runWinSec', ...
+         'hekaFile', 'pupilFile');
     fprintf('Saved %s\n', alignedFile);
+end
+
+%% ---------------- Helper ----------------
+function prctileValue = localPrctile(values, pct)
+% Percentile without the Statistics Toolbox
+values = sort(values(~isnan(values(:))));
+if isempty(values), prctileValue = 0; return; end
+prctileValue = values(max(1, min(numel(values), round(pct / 100 * numel(values)))));
 end
