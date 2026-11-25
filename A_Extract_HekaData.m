@@ -19,6 +19,7 @@
 
 %% Settings
 nChannels = 9;         % channels per sweep in the HEKA export
+sampleIntervalMs = 2.5;  % HEKA sample interval (ms)
 
 senseCheckGraphs = 1;  % 1 = plot raw vs demultiplexed photometry
 cutTheFront      = 0;  % 1 = drop the first cutTheFrontVal samples
