@@ -122,7 +122,7 @@ plotNames  = {['Phot1 ' photLabel], ['Phot2 ' photLabel], 'HR (bpm)', ...
 blockColours = lines(nBlocks);
 nPlots       = numel(plotFields);
 
-figure('Name', 'Laser blocks', 'Renderer', 'painters', 'Position', [100 50 600 900]);
+figure('Renderer', 'painters', 'Position', [500 200 400 800]);
 axPlots = gobjects(nPlots, 1);
 for plotLoop = 1:nPlots
     axPlots(plotLoop) = subplot(nPlots, 1, plotLoop);
@@ -137,12 +137,11 @@ for plotLoop = 1:nPlots
     patch([0 max(blockDurS) max(blockDurS) 0], yRange([1 1 2 2]), ...
           [0.85 0.9 1], 'EdgeColor', 'none', 'HandleVisibility', 'off');
 
-    blockLines = gobjects(nBlocks, 1);
     for blockLoop = 1:nBlocks
-        blockLines(blockLoop) = plot(blockTimeS, cutMat(blockLoop, :), ...
-            'Color', blockColours(blockLoop, :), 'LineWidth', 0.5);
+        plot(blockTimeS, cutMat(blockLoop, :), ...
+             'Color', blockColours(blockLoop, :), 'LineWidth', 0.5);
     end
-    meanLine = plot(blockTimeS, mean(cutMat, 1, 'omitnan'), 'k', 'LineWidth', 2);
+    plot(blockTimeS, mean(cutMat, 1, 'omitnan'), 'k', 'LineWidth', 2);
     hold off
 
     ylabel(plotNames{plotLoop})
@@ -150,23 +149,10 @@ for plotLoop = 1:nPlots
     if plotLoop < nPlots
         set(axPlots(plotLoop), 'XTickLabel', []);
     end
-    if plotLoop == 1
-        legend([blockLines; meanLine], ...
-               [arrayfun(@(blockNum) sprintf('Block %d', blockNum), 1:nBlocks, ...
-                         'UniformOutput', false), {'Mean'}], ...
-               'Location', 'eastoutside', 'Box', 'off');
-    end
 end
 xlabel(axPlots(end), 'Time from block onset (s)')
 linkaxes(axPlots, 'x');
 xlim(axPlots(end), [blockTimeS(1) blockTimeS(end)]);
-
-% Keep all panels the same width as the first one (which has the legend)
-firstPos = get(axPlots(1), 'Position');
-for plotLoop = 2:nPlots
-    panelPos = get(axPlots(plotLoop), 'Position');
-    set(axPlots(plotLoop), 'Position', [firstPos(1) panelPos(2) firstPos(3) panelPos(4)]);
-end
 
 %% ---------------- Save ----------------
 if saveBlocks
