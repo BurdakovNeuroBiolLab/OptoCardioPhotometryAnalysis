@@ -213,9 +213,11 @@ fprintf('HRV: %g s windows, median RMSSD %.2f ms; DFA alpha1 (whole crop) %.2f\n
 %% ---------------- 5. Running from the rotary encoder ----------------
 % Every state change of the binarised encoder is one tick; ticks are
 % counted in a sliding window of runWinSec and converted to ticks per second.
+% The window is trailing (the runWinSec before each sample), so running
+% never appears before it happened, e.g. before a laser onset.
 runTicks = [0; abs(diff(extractedMatCrop(:, 2)))];
 runWinSamples = max(1, round(runWinSec * hekaFs));
-runCrop  = movsum(runTicks, runWinSamples) / (runWinSamples / hekaFs);
+runCrop  = movsum(runTicks, [runWinSamples-1 0]) / (runWinSamples / hekaFs);
 
 %% ---------------- 6. Final figure over the camera period ----------------
 cropTimeS = hekaT - hekaT(1);                        % s from camera start
