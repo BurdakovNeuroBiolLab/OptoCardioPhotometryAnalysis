@@ -12,9 +12,10 @@
 %   3. alignPupilToPhotometry.m  -> pupil added as column 11, using the
 %                                   Cam Synch high period (first rise to
 %                                   last fall = start and end of the CSV)
-%   4. Heart rate from the ECG R peaks (same method as the GRIN code)
+%   4. Heart rate and HRV (RMSSD etc., DFA alpha1) from the ECG R peaks
+%      (same method as the GRIN code)
 %   5. Running speed from the rotary encoder
-%   6. Figure of photometry, laser, heart rate, pupil and running over the
+%   6. Figure of photometry, laser, heart rate, RMSSD, pupil and running over the
 %      camera period
 %   7. Save
 %
@@ -37,6 +38,10 @@
 %   rT                R-peak times (HEKA s), refined to sub-sample precision
 %   beatT, beatHR     time (HEKA s) and rate (bpm) of every beat-to-beat interval
 %   okHR              true for beat intervals kept (not missed / extra beats)
+%   hrvCrop           windowed HRV at every row of extractedMatCrop (struct):
+%                     HR (bpm), RMSSD (ms), CVSD, CV_IBI, HRV_resid, nIBI
+%   hrvMetrics        continuous_hrv_mouse output (window centres in HEKA s)
+%   alpha1Whole       DFA alpha1 over all valid IBIs of the crop
 %   runCrop           running (encoder ticks/s) at every row of extractedMatCrop
 
 clear; clc;
@@ -55,6 +60,8 @@ hrBaselineWin = 0.05;      % s, moving-mean window removed from the ECG
 ibiRelTol     = 0.3;       % drop IBIs > 30% away from the running median (missed /
                            % extra beats)
 showHRCheck   = false;     % true = extra figure with the detected R peaks
+hrvWindowSec  = 10;        % s, sliding window for HRV (continuous_hrv_mouse)
+hrvStepSec    = 0.25;      % s, step between HRV windows
 
 % Running from the rotary encoder
 runWinSec = 0.5;           % s, window over which encoder ticks are counted
@@ -65,7 +72,7 @@ if ~isempty(alignRepoDir)
     addpath(alignRepoDir);
 end
 childScripts = {'pupilCircleFit', 'A_Extract_HekaData', 'alignPupilToPhotometry', ...
-                'flag_bad_ibi'};
+                'flag_bad_ibi', 'continuous_hrv_mouse', 'dfa_alpha1_local'};
 for scriptLoop = 1:numel(childScripts)
     if isempty(which(childScripts{scriptLoop}))
         error(['Cannot find %s.m. Keep all the repository''s .m files in one ' ...
@@ -174,6 +181,35 @@ end
 fprintf('Heart rate: %d R peaks, median %.0f bpm (%d IBIs dropped: outside hrRange or >%g%% from local median)\n', ...
         nR, median(beatHR(okHR)), nnz(~okHR), 100 * ibiRelTol);
 
+%% ---------------- 4b. HRV ----------------
+% Same as the GRIN code: windowed HRV from continuous_hrv_mouse, with the
+% same IBIs as above (missed / extra beats) excluded, interpolated onto
+% every sample of the crop.
+hrvFields  = {'HR', 'RMSSD', 'CVSD', 'CV_IBI', 'HRV_resid', 'nIBI'};
+hrvCrop    = struct();
+for fieldLoop = 1:numel(hrvFields)
+    hrvCrop.(hrvFields{fieldLoop}) = nan(nCrop, 1);
+end
+hrvMetrics = struct();
+if nR >= 3 && rT(end) - rT(1) > hrvWindowSec
+    hrvMetrics = continuous_hrv_mouse(rT, hrvWindowSec, hrvStepSec, ibiRangeSec, ibiRelTol);
+    for fieldLoop = 1:numel(hrvFields)
+        hrvCrop.(hrvFields{fieldLoop}) = interp1(hrvMetrics.t, ...
+            hrvMetrics.(hrvFields{fieldLoop}), hekaT, 'linear', NaN);
+    end
+    hrvCrop.RMSSD = 1000 * hrvCrop.RMSSD;                   % s -> ms
+else
+    warning('Recording shorter than hrvWindowSec (%g s); HRV not computed.', hrvWindowSec);
+end
+
+% DFA alpha1 once over the whole crop (too few beats per window to be
+% reliable). Uses the valid IBIs only, joined across rejected ones.
+ibiValid    = diff(rT);
+ibiValid    = ibiValid(okHR);
+alpha1Whole = dfa_alpha1_local(ibiValid);
+fprintf('HRV: %g s windows, median RMSSD %.2f ms; DFA alpha1 (whole crop) %.2f\n', ...
+        hrvWindowSec, median(hrvCrop.RMSSD, 'omitnan'), alpha1Whole);
+
 %% ---------------- 5. Running from the rotary encoder ----------------
 % Every state change of the binarised encoder is one tick; ticks are
 % counted in a sliding window of runWinSec and converted to ticks per second.
@@ -186,11 +222,12 @@ cropTimeS = hekaT - hekaT(1);                        % s from camera start
 
 plotTraces = {extractedMatCrop(:, 6), extractedMatCrop(:, 5), ...
               extractedMatCrop(:, 9), extractedMatCrop(:, 8), ...
-              extractedMatCrop(:, 3), hrCrop, extractedMatCrop(:, 11), runCrop};
+              extractedMatCrop(:, 3), hrCrop, hrvCrop.RMSSD, ...
+              extractedMatCrop(:, 11), runCrop};
 plotNames  = {'Phot1 465', 'Phot1 405', 'Phot2 465', 'Phot2 405', ...
-              'Laser', 'HR (bpm)', 'Pupil (px)', 'Run (ticks/s)'};
+              'Laser', 'HR (bpm)', 'RMSSD (ms)', 'Pupil (px)', 'Run (ticks/s)'};
 plotColour = {[0 0.6 0], [0.7 0 0.7], [0 0.6 0], [0.7 0 0.7], ...
-              [0 0 0.8], [0.85 0.1 0.1], [0.9 0.5 0], [0.2 0.6 0.9]};
+              [0 0 0.8], [0.85 0.1 0.1], [0.9 0.4 0.7], [0.9 0.5 0], [0.2 0.6 0.9]};
 
 nPlots = numel(plotTraces);
 figure('Name', 'Photometry, heart rate, pupil and running', 'Renderer', 'painters', ...
@@ -226,6 +263,7 @@ if saveAligned
          'hekaMs', 'hekaMsCrop', 'camRise', 'camFall', 'pupilDiameter', ...
          'pupilHekaT', 'pupilPeriodMs', 'sampleIntervalMs', ...
          'hrCrop', 'rT', 'beatT', 'beatHR', 'okHR', 'runCrop', 'runWinSec', ...
+         'hrvCrop', 'hrvMetrics', 'alpha1Whole', 'hrvWindowSec', 'hrvStepSec', ...
          'hekaFile', 'pupilFile');
     fprintf('Saved %s\n', alignedFile);
 end
