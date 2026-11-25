@@ -13,7 +13,7 @@
 %                                   Cam Synch high period (first rise to
 %                                   last fall = start and end of the CSV)
 %   4. Heart rate and HRV (RMSSD etc., DFA alpha1) from the ECG R peaks
-%      (same method as the GRIN code)
+%      (hrMethod: GRIN-code method or preprocessMultipleMice_2 method)
 %   5. Running speed from the rotary encoder
 %   6. Figure of photometry, laser, heart rate, RMSSD, pupil and running over the
 %      camera period
@@ -35,6 +35,7 @@
 %   hekaMsCrop        time of every row of extractedMatCrop (ms)
 %   pupilHekaT        centre of each video frame in HEKA time (ms)
 %   hrCrop            heart rate (bpm) at every row of extractedMatCrop
+%                     (beat-to-beat for hrMethod 'claude', windowed for 'nikMattia')
 %   rT                R-peak times (HEKA s), refined to sub-sample precision
 %   beatT, beatHR     time (HEKA s) and rate (bpm) of every beat-to-beat interval
 %   okHR              true for beat intervals kept (not missed / extra beats)
@@ -53,7 +54,17 @@ expectedFps = [];     % camera frame rate (Hz). If set, warn when the rate
 fpsTol      = 0.02;   % fractional tolerance for the frame-rate check
 saveAligned = true;   % save the aligned data to a .mat in the current folder
 
-% Heart rate from the ECG (defaults for mouse, as in the GRIN code)
+% Heart rate method
+%   'claude'    : R peaks above a threshold, refined to sub-sample timing,
+%                 missed / extra beats removed; HR is beat-to-beat
+%                 (same as the GRIN code). Settings in the next block.
+%   'nikMattia' : band-pass + findpeaks, no beat rejection; HR is the
+%                 windowed HR from continuous_hrv_mouse (same as
+%                 preprocessMultipleMice_2). Settings in the block after.
+%                 Needs the Signal Processing Toolbox.
+hrMethod = 'claude';
+
+% 'claude' settings (defaults for mouse, as in the GRIN code)
 hrRange       = [250 900]; % bpm; beats outside this range are dropped
 hrThreshFrac  = 0.5;       % R-peak threshold as a fraction of the ECG 99.5th percentile
 hrBaselineWin = 0.05;      % s, moving-mean window removed from the ECG
@@ -62,6 +73,16 @@ ibiRelTol     = 0.3;       % drop IBIs > 30% away from the running median (misse
 showHRCheck   = false;     % true = extra figure with the detected R peaks
 hrvWindowSec  = 10;        % s, sliding window for HRV (continuous_hrv_mouse)
 hrvStepSec    = 0.25;      % s, step between HRV windows
+
+% 'nikMattia' settings (as in preprocessMultipleMice_2)
+nmEcgBand         = [8 30];  % Hz, band-pass
+nmMinProm         = 0.15;    % findpeaks MinPeakProminence (ECG units - check
+                             % this suits the HEKA ECG scale)
+nmMaxWidth        = 0.15;    % s, findpeaks MaxPeakWidth
+nmMinPeakDistance = 0.05;    % s, findpeaks MinPeakDistance (refractory period)
+nmInvertECG       = false;   % true = flip the ECG before peak detection
+nmHrvWindowSec    = 3;       % s, sliding window for HR / HRV
+nmHrvStepSec      = 0.25;    % s, step between windows
 
 % Running from the rotary encoder
 runWinSec = 0.5;           % s, window over which encoder ticks are counted
@@ -128,10 +149,14 @@ if ~isempty(expectedFps)
 end
 
 %% ---------------- 4. Heart rate from the ECG ----------------
+ecg         = extractedMatCrop(:, 1);
+ibiRangeSec = sort(60 ./ hrRange);
+
+switch hrMethod
+case 'claude'
 % Same method as A_Parent_Align_Heka_Pupil_Inscopix: R peaks are found in
 % the full-rate ECG of the crop, refined to sub-sample precision and turned
 % into beat-to-beat heart rate, which is interpolated onto every sample.
-ecg      = extractedMatCrop(:, 1);
 ecgHP    = ecg - movmean(ecg, max(3, round(hrBaselineWin * hekaFs)), 'omitnan');
 if abs(localPrctile(ecgHP, 0.1)) > abs(localPrctile(ecgHP, 99.9))
     ecgHP = -ecgHP;                                        % R peaks point down
@@ -169,38 +194,75 @@ pkShift(innerPeak) = max(-0.5, min(0.5, peakShift));
 rT     = hekaT(rIdx) + pkShift / hekaFs;                   % HEKA s
 beatT  = (rT(1:end-1) + rT(2:end)) / 2;                    % HEKA s
 beatHR = 60 ./ diff(rT);                                   % bpm
-ibiRangeSec = sort(60 ./ hrRange);
 okHR   = ~flag_bad_ibi(diff(rT), ibiRangeSec, ibiRelTol, 21);
 
-if nnz(okHR) >= 2
-    hrCrop = interp1(beatT(okHR), beatHR(okHR), hekaT, 'linear', NaN);
-else
-    hrCrop = nan(nCrop, 1);
-    warning('Fewer than 2 heart beats detected; check hrThreshFrac / hrRange.');
+% HRV: missed / extra beats excluded, as above
+hrvWinUsed   = hrvWindowSec;
+hrvStepUsed  = hrvStepSec;
+hrvRejectArg = {ibiRangeSec, ibiRelTol};
+
+case 'nikMattia'
+% Same method as preprocessMultipleMice_2: band-pass the ECG, find R peaks
+% with findpeaks, no beat rejection. HR is the windowed HR from
+% continuous_hrv_mouse (3 s windows by default).
+if nmInvertECG
+    ecg = -ecg;
 end
-fprintf('Heart rate: %d R peaks, median %.0f bpm (%d IBIs dropped: outside hrRange or >%g%% from local median)\n', ...
-        nR, median(beatHR(okHR)), nnz(~okHR), 100 * ibiRelTol);
+ecgHP = bandpass(ecg, nmEcgBand, hekaFs);
+[~, peakLocsSec] = findpeaks(ecgHP, hekaFs, 'MaxPeakWidth', nmMaxWidth, ...
+    'MinPeakProminence', nmMinProm, 'MinPeakDistance', nmMinPeakDistance);
+peakLocsSec = peakLocsSec(:);
+rIdx     = round(peakLocsSec * hekaFs) + 1;                % sample in the crop
+nR       = numel(rIdx);
+hrThresh = NaN;                                            % no fixed threshold
+rT       = hekaT(1) + peakLocsSec;                         % HEKA s
+beatT    = (rT(1:end-1) + rT(2:end)) / 2;                  % HEKA s
+beatHR   = 60 ./ diff(rT);                                 % bpm
+okHR     = true(size(beatHR));                             % no beat rejection
+
+% HRV: no beat rejection, as in preprocessMultipleMice_2
+hrvWinUsed   = nmHrvWindowSec;
+hrvStepUsed  = nmHrvStepSec;
+hrvRejectArg = {};
+
+otherwise
+    error('Unknown hrMethod ''%s''. Use ''claude'' or ''nikMattia''.', hrMethod);
+end
 
 %% ---------------- 4b. HRV ----------------
-% Same as the GRIN code: windowed HRV from continuous_hrv_mouse, with the
-% same IBIs as above (missed / extra beats) excluded, interpolated onto
-% every sample of the crop.
+% Windowed HRV from continuous_hrv_mouse, interpolated onto every sample
+% of the crop.
 hrvFields  = {'HR', 'RMSSD', 'CVSD', 'CV_IBI', 'HRV_resid', 'nIBI'};
 hrvCrop    = struct();
 for fieldLoop = 1:numel(hrvFields)
     hrvCrop.(hrvFields{fieldLoop}) = nan(nCrop, 1);
 end
 hrvMetrics = struct();
-if nR >= 3 && rT(end) - rT(1) > hrvWindowSec
-    hrvMetrics = continuous_hrv_mouse(rT, hrvWindowSec, hrvStepSec, ibiRangeSec, ibiRelTol);
+if nR >= 3 && rT(end) - rT(1) > hrvWinUsed
+    hrvMetrics = continuous_hrv_mouse(rT, hrvWinUsed, hrvStepUsed, hrvRejectArg{:});
     for fieldLoop = 1:numel(hrvFields)
         hrvCrop.(hrvFields{fieldLoop}) = interp1(hrvMetrics.t, ...
             hrvMetrics.(hrvFields{fieldLoop}), hekaT, 'linear', NaN);
     end
     hrvCrop.RMSSD = 1000 * hrvCrop.RMSSD;                   % s -> ms
 else
-    warning('Recording shorter than hrvWindowSec (%g s); HRV not computed.', hrvWindowSec);
+    warning('Recording shorter than the HRV window (%g s); HRV not computed.', hrvWinUsed);
 end
+
+%% ---------------- 4c. Heart rate on every sample ----------------
+% 'claude': beat-to-beat HR; 'nikMattia': windowed HR
+if strcmp(hrMethod, 'claude')
+    if nnz(okHR) >= 2
+        hrCrop = interp1(beatT(okHR), beatHR(okHR), hekaT, 'linear', NaN);
+    else
+        hrCrop = nan(nCrop, 1);
+        warning('Fewer than 2 heart beats detected; check hrThreshFrac / hrRange.');
+    end
+else
+    hrCrop = hrvCrop.HR;
+end
+fprintf('Heart rate (%s): %d R peaks, median %.0f bpm (%d IBIs dropped)\n', ...
+        hrMethod, nR, median(beatHR(okHR)), nnz(~okHR));
 
 % DFA alpha1 once over the whole crop (too few beats per window to be
 % reliable). Uses the valid IBIs only, joined across rejected ones.
@@ -208,7 +270,7 @@ ibiValid    = diff(rT);
 ibiValid    = ibiValid(okHR);
 alpha1Whole = dfa_alpha1_local(ibiValid);
 fprintf('HRV: %g s windows, median RMSSD %.2f ms; DFA alpha1 (whole crop) %.2f\n', ...
-        hrvWindowSec, median(hrvCrop.RMSSD, 'omitnan'), alpha1Whole);
+        hrvWinUsed, median(hrvCrop.RMSSD, 'omitnan'), alpha1Whole);
 
 %% ---------------- 5. Running from the rotary encoder ----------------
 % Every state change of the binarised encoder is one tick; ticks are
@@ -253,7 +315,8 @@ if showHRCheck
     figure('Name', 'ECG R-peak detection', 'Position', [100 100 1200 400]);
     plot(cropTimeS, ecgHP, 'k'); hold on
     plot(rT - hekaT(1), ecgHP(rIdx), 'r.', 'MarkerSize', 10);
-    yline(hrThresh, 'b--'); hold off
+    if ~isnan(hrThresh), yline(hrThresh, 'b--'); end
+    hold off
     xlabel('Time from camera start (s)'); ylabel('ECG (baseline removed)');
 end
 
@@ -265,7 +328,7 @@ if saveAligned
          'hekaMs', 'hekaMsCrop', 'camRise', 'camFall', 'pupilDiameter', ...
          'pupilHekaT', 'pupilPeriodMs', 'sampleIntervalMs', ...
          'hrCrop', 'rT', 'beatT', 'beatHR', 'okHR', 'runCrop', 'runWinSec', ...
-         'hrvCrop', 'hrvMetrics', 'alpha1Whole', 'hrvWindowSec', 'hrvStepSec', ...
+         'hrvCrop', 'hrvMetrics', 'alpha1Whole', 'hrMethod', 'hrvWinUsed', 'hrvStepUsed', ...
          'hekaFile', 'pupilFile');
     fprintf('Saved %s\n', alignedFile);
 end
