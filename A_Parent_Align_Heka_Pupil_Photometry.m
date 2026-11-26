@@ -45,7 +45,17 @@
 %   alpha1Whole       DFA alpha1 over all valid IBIs of the crop
 %   runCrop           running (encoder ticks/s) at every row of extractedMatCrop
 
-clear; clc;
+% C_Batch_Laser_Blocks sets batchMode = true and runs this script inside a
+% function, so the workspace is already empty and must not be cleared.
+if ~exist('batchMode', 'var') || ~batchMode
+    clear; clc;
+end
+
+% Title for every figure: mouse and day folder names, e.g. 'm947 d1 opto'
+[mousePath, dayName] = fileparts(pwd);
+[~, mouseName]       = fileparts(mousePath);
+recordingTitle       = [mouseName ' ' dayName];
+figuresBefore        = findall(0, 'Type', 'figure');
 
 %% ---------------- Settings ----------------
 expectedFps = [];     % camera frame rate (Hz). If set, warn when the rate
@@ -53,6 +63,7 @@ expectedFps = [];     % camera frame rate (Hz). If set, warn when the rate
                       % than fpsTol. [] = no check.
 fpsTol      = 0.02;   % fractional tolerance for the frame-rate check
 saveAligned = true;   % save the aligned data to a .mat in the current folder
+saveOverviewFig = true;  % save the final overview figure as .fig and .png
 
 % Heart rate method
 %   'claude'    : R peaks above a threshold, refined to sub-sample timing,
@@ -294,8 +305,8 @@ plotColour = {[0 0.6 0], [0.7 0 0.7], [0 0.6 0], [0.7 0 0.7], ...
               [0 0 0.8], [0.85 0.1 0.1], [0.9 0.4 0.7], [0.9 0.5 0], [0.2 0.6 0.9]};
 
 nPlots = numel(plotTraces);
-figure('Name', 'Photometry, heart rate, pupil and running', 'Renderer', 'painters', ...
-       'Position', [900 50 700 900]);
+overviewFig = figure('Name', 'Photometry, heart rate, pupil and running', ...
+                     'Renderer', 'painters', 'Position', [900 50 700 900]);
 axPlots = gobjects(nPlots, 1);
 for plotLoop = 1:nPlots
     axPlots(plotLoop) = subplot(nPlots, 1, plotLoop);
@@ -320,16 +331,28 @@ if showHRCheck
     xlabel('Time from camera start (s)'); ylabel('ECG (baseline removed)');
 end
 
+%% ---------------- Title every figure made by this script ----------------
+newFigures = setdiff(findall(0, 'Type', 'figure'), figuresBefore);
+for titleLoop = 1:numel(newFigures)
+    sgtitle(newFigures(titleLoop), recordingTitle, 'Interpreter', 'none');
+end
+
 %% ---------------- 7. Save ----------------
+[~, hekaBase] = fileparts(hekaFile);
+if saveOverviewFig
+    overviewBase = fullfile(pwd, [hekaBase '_overview']);
+    savefig(overviewFig, [overviewBase '.fig']);
+    print(overviewFig, [overviewBase '.png'], '-dpng', '-r300');
+    fprintf('Saved %s.fig and .png\n', overviewBase);
+end
 if saveAligned
-    [~, hekaBase] = fileparts(hekaFile);
     alignedFile = fullfile(pwd, [hekaBase '_pupilAligned.mat']);
     save(alignedFile, 'extractedMat', 'extractedMatCrop', 'colTitles', ...
          'hekaMs', 'hekaMsCrop', 'camRise', 'camFall', 'pupilDiameter', ...
          'pupilHekaT', 'pupilPeriodMs', 'sampleIntervalMs', ...
          'hrCrop', 'rT', 'beatT', 'beatHR', 'okHR', 'runCrop', 'runWinSec', ...
          'hrvCrop', 'hrvMetrics', 'alpha1Whole', 'hrMethod', 'hrvWinUsed', 'hrvStepUsed', ...
-         'hekaFile', 'pupilFile');
+         'hekaFile', 'pupilFile', 'recordingTitle');
     fprintf('Saved %s\n', alignedFile);
 end
 
